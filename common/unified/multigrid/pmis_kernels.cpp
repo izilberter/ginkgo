@@ -296,6 +296,7 @@ void direct_interpolation_fill(
                 return;
             }
             auto pos = zero(values[0]);
+            auto zeroval = zero(values[0]);
             auto pos_divisor = zero(values[0]);
             auto neg = zero(values[0]);
             auto neg_divisor = zero(values[0]);
@@ -311,7 +312,7 @@ void direct_interpolation_fill(
                     diag = val;
                     continue;
                 }
-                if (real(val) >= 0) {
+                if (real(val) >= real(zeroval)) {
                     pos += val;
                     if (coarse_map[col] != coarse_map[col + 1] &&
                         abs(val) >= strength_threshold * max_abs) {
@@ -340,13 +341,13 @@ void direct_interpolation_fill(
                 if (col == row || abs(val) < strength_threshold * max_abs) {
                     continue;
                 }
-                if (real(val) >= 0 && enable_pos &&
+                if (real(val) >= real(zeroval) && enable_pos &&
                     coarse_map[col] != coarse_map[col + 1]) {
                     prolong_col_idxs[p_idx] = coarse_map[col];
                     prolong_values[p_idx] = -pos * val / diag;
                     p_idx++;
                 }
-                if (real(val) < 0 && enable_neg &&
+                if (real(val) < real(zeroval) && enable_neg &&
                     coarse_map[col] != coarse_map[col + 1]) {
                     prolong_col_idxs[p_idx] = coarse_map[col];
                     prolong_values[p_idx] = -neg * val / diag;
