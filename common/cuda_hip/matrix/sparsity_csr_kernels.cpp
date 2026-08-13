@@ -147,7 +147,32 @@ template <typename ValueType, typename IndexType>
 void transpose(std::shared_ptr<const DefaultExecutor> exec,
                const matrix::SparsityCsr<ValueType, IndexType>* orig,
                matrix::SparsityCsr<ValueType, IndexType>* trans)
-    GKO_NOT_IMPLEMENTED;
+{
+    const auto orig_num_rows = orig->get_size()[0];
+    const auto trans_num_rows = trans->get_size()[0];
+    const auto nnz = orig->get_num_nonzeros();
+
+    const auto orig_row_ptrs = orig->get_const_row_ptrs();
+    const auto orig_col_idxs = orig->get_const_col_idxs();
+    auto trans_row_ptrs = trans->get_row_ptrs();
+    auto trans_col_idxs = trans->get_col_idxs();
+
+    // temp: transposed row indices (= original col indices, to be sorted)
+    array<IndexType> trans_row_idxs{exec, nnz};
+
+    // trans_col_idxs temporarily holds expanded orig row indices
+    components::convert_ptrs_to_idxs(exec, orig_row_ptrs, orig_num_rows,
+                                     trans_col_idxs);
+    exec->copy(nnz, orig_col_idxs, trans_row_idxs.get_data());
+
+    // sort both arrays by trans_row_idxs so entries are grouped by transposed row
+    thrust::sort_by_key(thrust_policy(exec), trans_row_idxs.get_data(),
+                        trans_row_idxs.get_data() + nnz, trans_col_idxs);
+
+    // compress sorted transposed row indices into row pointers
+    components::convert_idxs_to_ptrs(exec, trans_row_idxs.get_data(), nnz,
+                                     trans_num_rows, trans_row_ptrs);
+}
 
 GKO_INSTANTIATE_FOR_EACH_VALUE_AND_INDEX_TYPE(
     GKO_DECLARE_SPARSITY_CSR_TRANSPOSE_KERNEL);
