@@ -2578,25 +2578,64 @@ void spgemm(std::shared_ptr<const DefaultExecutor> exec,
     auto c_descr = sparselib::create_csr(m, n, zero_nnz, c_row_ptrs, null_index,
                                          null_value);
 
+    auto spgemm_alg = CUSPARSE_SPGEMM_ALG1;
+
     // estimate work
     size_type buffer1_size{};
-    sparselib::spgemm_work_estimation(handle, &alpha, a_descr, b_descr, &beta,
-                                      c_descr, spgemm_descr, buffer1_size,
-                                      nullptr);
-    array<char> buffer1{exec, buffer1_size};
-    sparselib::spgemm_work_estimation(handle, &alpha, a_descr, b_descr, &beta,
-                                      c_descr, spgemm_descr, buffer1_size,
-                                      buffer1.get_data());
-
-    // compute spgemm
     size_type buffer2_size{};
-    sparselib::spgemm_compute(handle, &alpha, a_descr, b_descr, &beta, c_descr,
-                              spgemm_descr, buffer1.get_data(), buffer2_size,
-                              nullptr);
-    array<char> buffer2{exec, buffer2_size};
-    sparselib::spgemm_compute(handle, &alpha, a_descr, b_descr, &beta, c_descr,
-                              spgemm_descr, buffer1.get_data(), buffer2_size,
-                              buffer2.get_data());
+    array<char> buffer1{exec};
+    array<char> buffer2{exec};
+
+    // Try CUSPARSE_SPGEMM_ALG1 first as it is fastest for small matrices
+    try {
+        // Memory estimate for Alg1
+        sparselib::spgemm_work_estimation(handle, &alpha, a_descr, b_descr,
+                                          &beta, c_descr, spgemm_descr,
+                                          spgemm_alg, buffer1_size, nullptr);
+        buffer1.resize_and_reset(buffer1_size);
+        sparselib::spgemm_work_estimation(
+            handle, &alpha, a_descr, b_descr, &beta, c_descr, spgemm_descr,
+            spgemm_alg, buffer1_size, buffer1.get_data());
+        sparselib::spgemm_compute(handle, &alpha, a_descr, b_descr, &beta,
+                                  c_descr, spgemm_descr, spgemm_alg,
+                                  buffer1.get_data(), buffer2_size, nullptr);
+        // compute spgemm
+        buffer2.resize_and_reset(buffer2_size);
+        sparselib::spgemm_compute(
+            handle, &alpha, a_descr, b_descr, &beta, c_descr, spgemm_descr,
+            spgemm_alg, buffer1.get_data(), buffer2_size, buffer2.get_data());
+    }
+
+    catch (const CusparseError& cse) {
+        // If estimated buffer size is too large and CUDA > 12.0,  fall back to
+        // ALG2
+#if CUDA_VERSION >= 12000
+        spgemm_alg = CUSPARSE_SPGEMM_ALG2;
+        // Memory estimate for Alg2/Alg3
+        sparselib::spgemm_work_estimation(handle, &alpha, a_descr, b_descr,
+                                          &beta, c_descr, spgemm_descr,
+                                          spgemm_alg, buffer1_size, nullptr);
+        buffer1.resize_and_reset(buffer1_size);
+        sparselib::spgemm_work_estimation(
+            handle, &alpha, a_descr, b_descr, &beta, c_descr, spgemm_descr,
+            spgemm_alg, buffer1_size, buffer1.get_data());
+        size_type buffer3_size{};
+        sparselib::spgemm_estimate_memory(
+            handle, &alpha, a_descr, b_descr, &beta, c_descr, spgemm_descr,
+            spgemm_alg, 1.0f, buffer3_size, nullptr, nullptr);
+        array<char> buffer3{exec, buffer3_size};
+        sparselib::spgemm_estimate_memory(
+            handle, &alpha, a_descr, b_descr, &beta, c_descr, spgemm_descr,
+            spgemm_alg, 1.0f, buffer3_size, buffer3.get_data(), &buffer2_size);
+        buffer2.resize_and_reset(buffer2_size);
+        // compute spgemm
+        sparselib::spgemm_compute(
+            handle, &alpha, a_descr, b_descr, &beta, c_descr, spgemm_descr,
+            spgemm_alg, buffer1.get_data(), buffer2_size, buffer2.get_data());
+#else  // CUDA_VERSION < 12000
+        throw(cse);
+#endif
+    }
 
     // copy data to result
     auto c_nnz = sparselib::sparse_matrix_nnz(c_descr);
@@ -2607,7 +2646,7 @@ void spgemm(std::shared_ptr<const DefaultExecutor> exec,
                                 c_vals_array.get_data());
 
     sparselib::spgemm_copy(handle, &alpha, a_descr, b_descr, &beta, c_descr,
-                           spgemm_descr);
+                           spgemm_descr, spgemm_alg);
 
     sparselib::destroy(c_descr);
     sparselib::destroy(b_descr);
@@ -2746,25 +2785,66 @@ void advanced_spgemm(std::shared_ptr<const DefaultExecutor> exec,
         sparselib::create_csr(m, n, zero_nnz, c_tmp_row_ptrs_array.get_data(),
                               null_index, null_value);
 
+    auto spgemm_alg = CUSPARSE_SPGEMM_ALG1;
     // estimate work
     size_type buffer1_size{};
-    sparselib::spgemm_work_estimation(handle, &one_val, a_descr, b_descr,
-                                      &zero_val, c_descr, spgemm_descr,
-                                      buffer1_size, nullptr);
-    array<char> buffer1{exec, buffer1_size};
-    sparselib::spgemm_work_estimation(handle, &one_val, a_descr, b_descr,
-                                      &zero_val, c_descr, spgemm_descr,
-                                      buffer1_size, buffer1.get_data());
-
-    // compute spgemm
     size_type buffer2_size{};
-    sparselib::spgemm_compute(handle, &one_val, a_descr, b_descr, &zero_val,
-                              c_descr, spgemm_descr, buffer1.get_data(),
-                              buffer2_size, nullptr);
-    array<char> buffer2{exec, buffer2_size};
-    sparselib::spgemm_compute(handle, &one_val, a_descr, b_descr, &zero_val,
-                              c_descr, spgemm_descr, buffer1.get_data(),
-                              buffer2_size, buffer2.get_data());
+    array<char> buffer1{exec};
+    array<char> buffer2{exec};
+
+    // Try CUSPARSE_SPGEMM_ALG1 first as it is fastest for small matrices
+    try {
+        // Memory estimate for Alg1
+        sparselib::spgemm_work_estimation(handle, &one_val, a_descr, b_descr,
+                                          &zero_val, c_descr, spgemm_descr,
+                                          spgemm_alg, buffer1_size, nullptr);
+        buffer1.resize_and_reset(buffer1_size);
+        sparselib::spgemm_work_estimation(
+            handle, &one_val, a_descr, b_descr, &zero_val, c_descr,
+            spgemm_descr, spgemm_alg, buffer1_size, buffer1.get_data());
+        sparselib::spgemm_compute(handle, &one_val, a_descr, b_descr, &zero_val,
+                                  c_descr, spgemm_descr, spgemm_alg,
+                                  buffer1.get_data(), buffer2_size, nullptr);
+        // compute spgemm
+        buffer2.resize_and_reset(buffer2_size);
+        sparselib::spgemm_compute(handle, &one_val, a_descr, b_descr, &zero_val,
+                                  c_descr, spgemm_descr, spgemm_alg,
+                                  buffer1.get_data(), buffer2_size,
+                                  buffer2.get_data());
+    }
+
+    catch (const CusparseError& cse) {
+        // If estimated buffer size is too large and CUDA > 12.0,  fall back to
+        // ALG2
+#if CUDA_VERSION >= 12000
+        spgemm_alg = CUSPARSE_SPGEMM_ALG2;
+        // Memory estimate for Alg2/Alg3
+        sparselib::spgemm_work_estimation(handle, &one_val, a_descr, b_descr,
+                                          &zero_val, c_descr, spgemm_descr,
+                                          spgemm_alg, buffer1_size, nullptr);
+        buffer1.resize_and_reset(buffer1_size);
+        sparselib::spgemm_work_estimation(
+            handle, &one_val, a_descr, b_descr, &zero_val, c_descr,
+            spgemm_descr, spgemm_alg, buffer1_size, buffer1.get_data());
+        size_type buffer3_size{};
+        sparselib::spgemm_estimate_memory(
+            handle, &one_val, a_descr, b_descr, &zero_val, c_descr,
+            spgemm_descr, spgemm_alg, 1.0f, buffer3_size, nullptr, nullptr);
+        array<char> buffer3{exec, buffer3_size};
+        sparselib::spgemm_estimate_memory(handle, &one_val, a_descr, b_descr,
+                                          &zero_val, c_descr, spgemm_descr,
+                                          spgemm_alg, 1.0f, buffer3_size,
+                                          buffer3.get_data(), &buffer2_size);
+        buffer2.resize_and_reset(buffer2_size);
+        // compute spgemm
+        sparselib::spgemm_compute(handle, &one_val, a_descr, b_descr, &zero_val,
+                                  c_descr, spgemm_descr, spgemm_alg,
+                                  buffer1.get_data(), buffer2_size,
+                                  buffer2.get_data());
+#else  // CUDA_VERSION < 12000
+        throw(cse);
+#endif
+    }
 
     // write result to temporary storage
     auto c_tmp_nnz = sparselib::sparse_matrix_nnz(c_descr);
@@ -2775,7 +2855,7 @@ void advanced_spgemm(std::shared_ptr<const DefaultExecutor> exec,
                                 c_tmp_vals_array.get_data());
 
     sparselib::spgemm_copy(handle, &one_val, a_descr, b_descr, &zero_val,
-                           c_descr, spgemm_descr);
+                           c_descr, spgemm_descr, spgemm_alg);
 
     sparselib::destroy(c_descr);
     sparselib::destroy(b_descr);
@@ -2790,11 +2870,11 @@ void advanced_spgemm(std::shared_ptr<const DefaultExecutor> exec,
             return compiled_subwarp_size >= nnz_per_row ||
                    compiled_subwarp_size == config::warp_size;
         },
-        syn::value_list<int>(), syn::type_list<>(), exec, alpha.values,
-        c_tmp_row_ptrs_array.get_const_data(),
+        syn::value_list<int>(), syn::type_list<>(), exec,
+        alpha.values, c_tmp_row_ptrs_array.get_const_data(),
         c_tmp_col_idxs_array.get_const_data(),
-        c_tmp_vals_array.get_const_data(), beta.values, d_row_ptrs, d_col_idxs,
-        d_vals, c_builder);
+        c_tmp_vals_array.get_const_data(), beta.values, d_row_ptrs,
+        d_col_idxs, d_vals, c_builder);
 #endif  // GKO_COMPILING_CUDA
 }
 
