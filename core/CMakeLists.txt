@@ -123,6 +123,7 @@ target_sources(
         solver/gmres.cpp
         solver/idr.cpp
         solver/ir.cpp
+        solver/jacobi_smoother.cpp
         solver/lower_trs.cpp
         solver/minres.cpp
         solver/multigrid.cpp

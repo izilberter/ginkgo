@@ -68,6 +68,7 @@ target_sources(
         solver/gmres_kernels.cpp
         solver/idr_kernels.cpp
         solver/ir_kernels.cpp
+        solver/jacobi_smoother_kernels.cpp
         solver/lower_trs_kernels.cpp
         solver/minres_kernels.cpp
         solver/multigrid_kernels.cpp

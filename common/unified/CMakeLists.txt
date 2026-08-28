@@ -34,6 +34,7 @@ set(UNIFIED_SOURCES
     solver/gcr_kernels.cpp
     solver/gmres_kernels.cpp
     solver/ir_kernels.cpp
+    solver/jacobi_smoother_kernels.cpp
     solver/minres_kernels.cpp
 )
 list(TRANSFORM UNIFIED_SOURCES PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)

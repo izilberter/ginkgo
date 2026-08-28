@@ -33,6 +33,7 @@ set(EXAMPLES_LIST
     mixed-multigrid-preconditioned-solver
     multigrid-preconditioned-solver
     multigrid-preconditioned-solver-customized
+    multigrid-pmis-solver
     par-ilu-convergence
     performance-debugging
     preconditioner-export
@@ -65,6 +66,7 @@ if(GINKGO_BUILD_MPI)
         EXAMPLES_LIST
         distributed-solver
         distributed-multigrid-preconditioned-solver
+        distributed-pmis-solver
     )
 endif()
 

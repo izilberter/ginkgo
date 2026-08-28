@@ -80,6 +80,17 @@ public:
          * incorrect.
          */
         bool GKO_FACTORY_PARAMETER_SCALAR(skip_sorting, false);
+
+        /**
+         * Truncation factor for the prolongation operator.  After computing
+         * interpolation weights for each fine row, entries whose absolute
+         * value is less than truncation_factor * max_entry_in_row are dropped.
+         * 0.0 (default) disables truncation.  Typical values: 0.2 – 0.5.
+         * Reduces operator complexity at the cost of some interpolation
+         * accuracy, making the hierarchy more geometric-like.
+         */
+        remove_complex<ValueType> GKO_FACTORY_PARAMETER_SCALAR(
+            truncation_factor, remove_complex<ValueType>{0.0});
     };
     GKO_ENABLE_LIN_OP_FACTORY(Pmis, parameters, Factory);
     GKO_ENABLE_BUILD_METHOD(Factory);
@@ -114,6 +125,14 @@ protected:
                   std::shared_ptr<const LinOp> system_matrix);
 
     void generate();
+
+#if GINKGO_BUILD_MPI
+    template <typename GlobalIndexType>
+    void generate_distributed(
+        std::shared_ptr<const experimental::distributed::Matrix<
+            ValueType, IndexType, GlobalIndexType>>
+            matrix);
+#endif
 
 private:
     std::shared_ptr<const LinOp> system_matrix_{};
