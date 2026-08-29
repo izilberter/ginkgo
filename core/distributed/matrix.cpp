@@ -4,7 +4,10 @@
 
 #include "ginkgo/core/distributed/matrix.hpp"
 
+#include <algorithm>
+#include <numeric>
 #include <utility>
+#include <vector>
 
 #include <ginkgo/core/base/array.hpp>
 #include <ginkgo/core/base/precision_dispatch.hpp>
@@ -525,10 +528,483 @@ init_recv_buffers(std::shared_ptr<const Executor> exec,
 }
 
 
+// Helper: build a local CSR from host COO data (rows already sorted).
+// Computes CSR row pointers from the COO row array.
+template <typename ValueType, typename LocalIndexType>
+static std::shared_ptr<gko::matrix::Csr<ValueType, LocalIndexType>>
+coo_to_csr(std::shared_ptr<const Executor> exec,
+           std::shared_ptr<const Executor> host,
+           size_type nrows, size_type ncols,
+           std::vector<LocalIndexType>& rows,
+           std::vector<LocalIndexType>& cols,
+           std::vector<ValueType>& vals)
+{
+    using csr_type = gko::matrix::Csr<ValueType, LocalIndexType>;
+    const auto nnz = rows.size();
+    std::vector<LocalIndexType> rp(nrows + 1, 0);
+    for (auto r : rows) rp[r + 1]++;
+    for (size_type r = 0; r < nrows; r++) rp[r + 1] += rp[r];
+
+    array<LocalIndexType> d_rp{exec, nrows + 1};
+    array<LocalIndexType> d_ci{exec, nnz};
+    array<ValueType>      d_vs{exec, nnz};
+    exec->copy_from(host, nrows + 1, rp.data(),   d_rp.get_data());
+    exec->copy_from(host, nnz,       cols.data(),  d_ci.get_data());
+    exec->copy_from(host, nnz,       vals.data(),  d_vs.get_data());
+    return csr_type::create(exec, dim<2>{nrows, ncols},
+                            std::move(d_vs), std::move(d_ci), std::move(d_rp));
+}
+
+
+template <typename ValueType, typename LocalIndexType, typename GlobalIndexType>
+void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
+    const Matrix* B, Matrix* C) const
+{
+    // Computes C = A * B (this = A).
+    //
+    // Algorithm:
+    //  1. Exchange B-row nnz counts via A's existing CollectiveCommunicator.
+    //  2. Exchange B-row data (global col + value) via MPI_Alltoallv.
+    //  3. Build A_ext = [A_diag | A_off] and B_ext (local + ghost rows of B)
+    //     with a shared local column space.
+    //  4. Local SpGeMM: C_tmp = A_ext * B_ext  (uses cuSPARSE on CUDA).
+    //  5. Split C_tmp into diag/off-diag, build new index_map and RowGatherer.
+    //
+    // Requirements: diag_mtx_ and off_diag_mtx_ must be Csr on both A and B.
+    // Assumes contiguous 1D row/column partitions.
+
+    using csr_type = gko::matrix::Csr<ValueType, LocalIndexType>;
+
+    auto exec = this->get_executor();
+    auto host = exec->get_master();
+    auto comm = this->get_communicator();
+    const int nproc   = comm.size();
+    const int my_rank = comm.rank();
+
+    // ---- Local CSR blocks ----
+    const auto* A_diag = gko::as<const csr_type>(this->diag_mtx_).get();
+    const auto* A_off  = gko::as<const csr_type>(this->off_diag_mtx_).get();
+    const auto* B_diag = gko::as<const csr_type>(B->diag_mtx_).get();
+    const auto* B_off  = gko::as<const csr_type>(B->off_diag_mtx_).get();
+
+    const auto n_local   = static_cast<size_type>(A_diag->get_size()[0]);
+    const auto n_ghost_A = static_cast<size_type>(A_off->get_size()[1]);
+    const auto n_local_B = static_cast<size_type>(B_diag->get_size()[1]);
+    const auto n_ghost_B = static_cast<size_type>(B_off->get_size()[1]);
+
+    // B_col_offset: global index of B's first local column on this rank
+    // (exclusive prefix sum of local B column counts across ranks).
+    GlobalIndexType B_col_offset = 0;
+    {
+        long long local_B = static_cast<long long>(n_local_B);
+        long long scan_B  = 0;
+        MPI_Exscan(&local_B, &scan_B, 1, MPI_LONG_LONG, MPI_SUM, comm.get());
+        B_col_offset = (my_rank == 0) ? 0 : static_cast<GlobalIndexType>(scan_B);
+    }
+
+    // ---- Copy blocks to host ----
+    auto d2h = [&](const auto* ptr, size_type n) {
+        using T = std::remove_const_t<std::remove_pointer_t<decltype(ptr)>>;
+        std::vector<T> v(n);
+        if (n > 0) host->copy_from(exec, n, ptr, v.data());
+        return v;
+    };
+
+    auto A_d_rp = d2h(A_diag->get_const_row_ptrs(), n_local + 1);
+    auto A_d_ci = d2h(A_diag->get_const_col_idxs(), A_diag->get_num_stored_elements());
+    auto A_d_vs = d2h(A_diag->get_const_values(),   A_diag->get_num_stored_elements());
+    auto A_o_rp = d2h(A_off->get_const_row_ptrs(),  n_local + 1);
+    auto A_o_ci = d2h(A_off->get_const_col_idxs(),  A_off->get_num_stored_elements());
+    auto A_o_vs = d2h(A_off->get_const_values(),    A_off->get_num_stored_elements());
+
+    auto B_d_rp = d2h(B_diag->get_const_row_ptrs(), n_local + 1);
+    auto B_d_ci = d2h(B_diag->get_const_col_idxs(), B_diag->get_num_stored_elements());
+    auto B_d_vs = d2h(B_diag->get_const_values(),   B_diag->get_num_stored_elements());
+    auto B_o_rp = d2h(B_off->get_const_row_ptrs(),  n_local + 1);
+    auto B_o_ci = d2h(B_off->get_const_col_idxs(),  B_off->get_num_stored_elements());
+    auto B_o_vs = d2h(B_off->get_const_values(),    B_off->get_num_stored_elements());
+
+    // B's ghost column global indices (from B's imap, flat)
+    auto B_ghost_gcol = d2h(
+        B->imap_.get_remote_global_idxs().get_const_flat_data(), n_ghost_B);
+
+    // A's communication pattern
+    auto coll_comm = this->row_gatherer_->get_collective_communicator();
+    const auto send_size = static_cast<size_type>(coll_comm->get_send_size());
+    const auto recv_size = static_cast<size_type>(coll_comm->get_recv_size());
+    GKO_ASSERT(recv_size == n_ghost_A);
+
+    auto send_idxs_h = d2h(this->row_gatherer_->get_const_send_idxs(), send_size);
+
+    // ============================================================
+    // Phase 1: Exchange B-row nnz counts using existing coll_comm.
+    // (One int per row — same topology as SpMV but different type.)
+    // ============================================================
+    std::vector<int> send_nnz(send_size, 0);
+    for (size_type i = 0; i < send_size; i++) {
+        LocalIndexType r = send_idxs_h[i];
+        send_nnz[i] = static_cast<int>(
+            (B_d_rp[r + 1] - B_d_rp[r]) + (B_o_rp[r + 1] - B_o_rp[r]));
+    }
+
+    exec->synchronize();
+    std::vector<int> recv_nnz(recv_size, 0);
+    coll_comm->i_all_to_all_v(host, send_nnz.data(), recv_nnz.data()).wait();
+
+    int total_send_data = 0;
+    for (int n : send_nnz) total_send_data += n;
+    int total_recv_data = 0;
+    for (int n : recv_nnz) total_recv_data += n;
+
+    // Offset into recv data buffer for ghost row k
+    std::vector<int> recv_nnz_offs(recv_size + 1, 0);
+    for (size_type k = 0; k < recv_size; k++)
+        recv_nnz_offs[k + 1] = recv_nnz_offs[k] + recv_nnz[k];
+
+    // ============================================================
+    // Build per-rank row counts to determine per-rank data counts.
+    // recv_row_counts[r]: rows of B received from rank r.
+    // send_row_counts[r]: rows of B sent to rank r.
+    // ============================================================
+    std::vector<int> recv_row_counts(nproc, 0);
+    {
+        const auto& rim   = this->imap_.get_remote_global_idxs();
+        const auto& rtids = this->imap_.get_remote_target_ids();
+        const auto  n_seg = rim.get_segment_count();
+        std::vector<int64> seg_offs(n_seg + 1);
+        std::vector<comm_index_type> tids(n_seg);
+        host->copy_from(exec,
+                        n_seg + 1, rim.get_offsets().get_const_data(),
+                        seg_offs.data());
+        host->copy_from(exec,
+                        n_seg, rtids.get_const_data(), tids.data());
+        for (size_type s = 0; s < n_seg; s++)
+            recv_row_counts[tids[s]] =
+                static_cast<int>(seg_offs[s + 1] - seg_offs[s]);
+    }
+
+    std::vector<int> send_row_counts(nproc, 0);
+    MPI_Alltoall(recv_row_counts.data(), 1, MPI_INT,
+                 send_row_counts.data(), 1, MPI_INT, comm.get());
+
+    // Cumulative per-rank row offsets into send_idxs (send topology is sorted
+    // by ascending destination rank, matching NeighborhoodCommunicator ordering).
+    std::vector<int> send_row_offs(nproc + 1, 0);
+    for (int r = 0; r < nproc; r++)
+        send_row_offs[r + 1] = send_row_offs[r] + send_row_counts[r];
+
+    // Per-rank data counts for MPI_Alltoallv
+    std::vector<int> send_dcnt(nproc, 0), recv_dcnt(nproc, 0);
+    {
+        const auto& rim   = this->imap_.get_remote_global_idxs();
+        const auto& rtids = this->imap_.get_remote_target_ids();
+        const auto  n_seg = rim.get_segment_count();
+        std::vector<int64> seg_offs(n_seg + 1);
+        std::vector<comm_index_type> tids(n_seg);
+        host->copy_from(exec,
+                        n_seg + 1, rim.get_offsets().get_const_data(),
+                        seg_offs.data());
+        host->copy_from(exec,
+                        n_seg, rtids.get_const_data(), tids.data());
+        for (size_type s = 0; s < n_seg; s++)
+            for (int64 k = seg_offs[s]; k < seg_offs[s + 1]; k++)
+                recv_dcnt[tids[s]] += recv_nnz[k];
+    }
+    for (int r = 0; r < nproc; r++)
+        for (int i = send_row_offs[r]; i < send_row_offs[r + 1]; i++)
+            send_dcnt[r] += send_nnz[i];
+
+    std::vector<int> send_doffs(nproc + 1, 0), recv_doffs(nproc + 1, 0);
+    for (int r = 0; r < nproc; r++) {
+        send_doffs[r + 1] = send_doffs[r] + send_dcnt[r];
+        recv_doffs[r + 1] = recv_doffs[r] + recv_dcnt[r];
+    }
+
+    // ============================================================
+    // Phase 2: Exchange B-row data (global_col, value) via Alltoallv.
+    // ============================================================
+    std::vector<GlobalIndexType> send_cols(total_send_data);
+    std::vector<ValueType>       send_vals(total_send_data);
+    {
+        int pos = 0;
+        for (size_type i = 0; i < send_size; i++) {
+            LocalIndexType r = send_idxs_h[i];
+            for (auto j = B_d_rp[r]; j < B_d_rp[r + 1]; j++) {
+                send_cols[pos] =
+                    B_col_offset + static_cast<GlobalIndexType>(B_d_ci[j]);
+                send_vals[pos] = B_d_vs[j];
+                pos++;
+            }
+            for (auto j = B_o_rp[r]; j < B_o_rp[r + 1]; j++) {
+                send_cols[pos] = B_ghost_gcol[B_o_ci[j]];
+                send_vals[pos] = B_o_vs[j];
+                pos++;
+            }
+        }
+    }
+
+    std::vector<GlobalIndexType> recv_cols(total_recv_data);
+    std::vector<ValueType>       recv_vals(total_recv_data);
+
+    auto gidx_mpi = experimental::mpi::type_impl<GlobalIndexType>::get_type();
+    auto val_mpi  = experimental::mpi::type_impl<ValueType>::get_type();
+    MPI_Alltoallv(send_cols.data(), send_dcnt.data(), send_doffs.data(), gidx_mpi,
+                  recv_cols.data(), recv_dcnt.data(), recv_doffs.data(), gidx_mpi,
+                  comm.get());
+    MPI_Alltoallv(send_vals.data(), send_dcnt.data(), send_doffs.data(), val_mpi,
+                  recv_vals.data(), recv_dcnt.data(), recv_doffs.data(), val_mpi,
+                  comm.get());
+
+    // ============================================================
+    // Build A_ext = [A_diag | A_off] (n_local x n_local+n_ghost_A).
+    // A_diag cols unchanged; A_off cols shifted by n_local.
+    // Rows are already col-sorted within each block and the two blocks
+    // cover disjoint col ranges, so the merged row is also sorted.
+    // ============================================================
+    const auto A_ext_nnz =
+        A_diag->get_num_stored_elements() + A_off->get_num_stored_elements();
+    std::vector<LocalIndexType> A_ext_rp(n_local + 1);
+    std::vector<LocalIndexType> A_ext_ci(A_ext_nnz);
+    std::vector<ValueType>      A_ext_vs(A_ext_nnz);
+    {
+        size_type pos = 0;
+        for (size_type r = 0; r < n_local; r++) {
+            A_ext_rp[r] = static_cast<LocalIndexType>(pos);
+            for (auto j = A_d_rp[r]; j < A_d_rp[r + 1]; j++) {
+                A_ext_ci[pos] = A_d_ci[j];
+                A_ext_vs[pos] = A_d_vs[j];
+                pos++;
+            }
+            for (auto j = A_o_rp[r]; j < A_o_rp[r + 1]; j++) {
+                A_ext_ci[pos] =
+                    static_cast<LocalIndexType>(n_local) + A_o_ci[j];
+                A_ext_vs[pos] = A_o_vs[j];
+                pos++;
+            }
+        }
+        A_ext_rp[n_local] = static_cast<LocalIndexType>(pos);
+    }
+
+    // ============================================================
+    // Collect unique global columns across all B_ext rows, build
+    // global→local bijection for the SpGeMM column space.
+    // ============================================================
+    std::vector<GlobalIndexType> all_gcols;
+    all_gcols.reserve(B_diag->get_num_stored_elements() +
+                      B_off->get_num_stored_elements() + total_recv_data);
+    for (size_type r = 0; r < n_local; r++) {
+        for (auto j = B_d_rp[r]; j < B_d_rp[r + 1]; j++)
+            all_gcols.push_back(
+                B_col_offset + static_cast<GlobalIndexType>(B_d_ci[j]));
+        for (auto j = B_o_rp[r]; j < B_o_rp[r + 1]; j++)
+            all_gcols.push_back(B_ghost_gcol[B_o_ci[j]]);
+    }
+    for (int k = 0; k < total_recv_data; k++)
+        all_gcols.push_back(recv_cols[k]);
+
+    std::sort(all_gcols.begin(), all_gcols.end());
+    all_gcols.erase(std::unique(all_gcols.begin(), all_gcols.end()),
+                    all_gcols.end());
+    const size_type m = all_gcols.size();  // unique columns in C
+
+    // Map a global column to its local index in [0, m)
+    auto to_local_col = [&](GlobalIndexType gc) -> LocalIndexType {
+        return static_cast<LocalIndexType>(
+            std::lower_bound(all_gcols.begin(), all_gcols.end(), gc) -
+            all_gcols.begin());
+    };
+
+    // ============================================================
+    // Build B_ext (n_local + n_ghost_A rows x m cols).
+    // Rows 0..n_local-1   : local B rows.
+    // Rows n_local..n_local+n_ghost_A-1: fetched ghost B rows.
+    // Each row is sorted by local col index (required by cuSPARSE SpGeMM).
+    // ============================================================
+    const auto B_ext_nrows =
+        static_cast<size_type>(n_local + n_ghost_A);
+    const auto B_ext_nnz =
+        B_diag->get_num_stored_elements() + B_off->get_num_stored_elements() +
+        static_cast<size_type>(total_recv_data);
+    std::vector<LocalIndexType> B_ext_rp(B_ext_nrows + 1);
+    std::vector<LocalIndexType> B_ext_ci(B_ext_nnz);
+    std::vector<ValueType>      B_ext_vs(B_ext_nnz);
+    {
+        size_type pos = 0;
+        auto emit_sorted_row =
+            [&](std::vector<std::pair<LocalIndexType, ValueType>>& row) {
+                std::sort(row.begin(), row.end(),
+                          [](const auto& a, const auto& b) {
+                              return a.first < b.first;
+                          });
+                for (auto& entry : row) {
+                    B_ext_ci[pos] = entry.first;
+                    B_ext_vs[pos] = entry.second;
+                    pos++;
+                }
+            };
+
+        // Local B rows
+        for (size_type r = 0; r < n_local; r++) {
+            B_ext_rp[r] = static_cast<LocalIndexType>(pos);
+            std::vector<std::pair<LocalIndexType, ValueType>> row;
+            row.reserve((B_d_rp[r + 1] - B_d_rp[r]) +
+                        (B_o_rp[r + 1] - B_o_rp[r]));
+            for (auto j = B_d_rp[r]; j < B_d_rp[r + 1]; j++)
+                row.emplace_back(
+                    to_local_col(B_col_offset +
+                                 static_cast<GlobalIndexType>(B_d_ci[j])),
+                    B_d_vs[j]);
+            for (auto j = B_o_rp[r]; j < B_o_rp[r + 1]; j++)
+                row.emplace_back(to_local_col(B_ghost_gcol[B_o_ci[j]]),
+                                 B_o_vs[j]);
+            emit_sorted_row(row);
+        }
+
+        // Ghost B rows (received)
+        for (size_type k = 0; k < n_ghost_A; k++) {
+            B_ext_rp[n_local + k] = static_cast<LocalIndexType>(pos);
+            std::vector<std::pair<LocalIndexType, ValueType>> row;
+            row.reserve(recv_nnz[k]);
+            for (int j = recv_nnz_offs[k]; j < recv_nnz_offs[k + 1]; j++)
+                row.emplace_back(to_local_col(recv_cols[j]), recv_vals[j]);
+            emit_sorted_row(row);
+        }
+        B_ext_rp[B_ext_nrows] = static_cast<LocalIndexType>(pos);
+    }
+
+    // Transfer A_ext and B_ext to device
+    auto make_dev_csr =
+        [&](size_type nrows, size_type ncols,
+            std::vector<LocalIndexType>& rp, std::vector<LocalIndexType>& ci,
+            std::vector<ValueType>& vs) -> std::shared_ptr<csr_type> {
+            const auto nnz = ci.size();
+            array<LocalIndexType> d_rp{exec, nrows + 1};
+            array<LocalIndexType> d_ci{exec, nnz};
+            array<ValueType>      d_vs{exec, nnz};
+            exec->copy_from(host, nrows + 1, rp.data(), d_rp.get_data());
+            if (nnz > 0) {
+                exec->copy_from(host, nnz, ci.data(), d_ci.get_data());
+                exec->copy_from(host, nnz, vs.data(), d_vs.get_data());
+            }
+            return share(csr_type::create(
+                exec, dim<2>{nrows, ncols},
+                std::move(d_vs), std::move(d_ci), std::move(d_rp)));
+        };
+
+    auto A_ext_dev = make_dev_csr(n_local, n_local + n_ghost_A,
+                                  A_ext_rp, A_ext_ci, A_ext_vs);
+    auto B_ext_dev = make_dev_csr(B_ext_nrows, m,
+                                  B_ext_rp, B_ext_ci, B_ext_vs);
+
+    // ============================================================
+    // Local SpGeMM: C_tmp = A_ext * B_ext  (uses cuSPARSE on CUDA)
+    // ============================================================
+    auto C_tmp = csr_type::create(exec, dim<2>{n_local, m});
+    A_ext_dev->apply(B_ext_dev.get(), C_tmp.get());
+
+    // ============================================================
+    // Split C_tmp into diag and off-diag blocks.
+    // Diag: global col in [B_col_offset, B_col_offset + n_local_B).
+    // Off-diag: all other global cols.
+    // ============================================================
+    const auto C_tmp_nnz = C_tmp->get_num_stored_elements();
+    auto C_rp_h = d2h(C_tmp->get_const_row_ptrs(), n_local + 1);
+    auto C_ci_h = d2h(C_tmp->get_const_col_idxs(), C_tmp_nnz);
+    auto C_vs_h = d2h(C_tmp->get_const_values(),   C_tmp_nnz);
+
+    std::vector<LocalIndexType>  c_d_rows, c_d_cols;
+    std::vector<ValueType>       c_d_vals;
+    std::vector<LocalIndexType>  c_o_rows;
+    std::vector<GlobalIndexType> c_o_gcols;
+    std::vector<ValueType>       c_o_vals;
+
+    const GlobalIndexType B_col_end =
+        B_col_offset + static_cast<GlobalIndexType>(n_local_B);
+    for (size_type r = 0; r < n_local; r++) {
+        for (auto j = C_rp_h[r]; j < C_rp_h[r + 1]; j++) {
+            GlobalIndexType gc = all_gcols[C_ci_h[j]];
+            auto lr = static_cast<LocalIndexType>(r);
+            if (gc >= B_col_offset && gc < B_col_end) {
+                c_d_rows.push_back(lr);
+                c_d_cols.push_back(
+                    static_cast<LocalIndexType>(gc - B_col_offset));
+                c_d_vals.push_back(C_vs_h[j]);
+            } else {
+                c_o_rows.push_back(lr);
+                c_o_gcols.push_back(gc);
+                c_o_vals.push_back(C_vs_h[j]);
+            }
+        }
+    }
+
+    // Build C's index map from the off-diagonal global column indices.
+    // Reconstruct B's column partition so index_map can classify columns.
+    auto B_col_partition = gko::share(
+        experimental::distributed::build_partition_from_local_size<
+            LocalIndexType, GlobalIndexType>(exec, comm, n_local_B));
+
+    array<GlobalIndexType> d_o_gcols{exec, c_o_gcols.size()};
+    if (!c_o_gcols.empty())
+        exec->copy_from(host, c_o_gcols.size(), c_o_gcols.data(),
+                        d_o_gcols.get_data());
+
+    auto c_imap =
+        experimental::distributed::index_map<LocalIndexType, GlobalIndexType>(
+            exec, B_col_partition, my_rank, d_o_gcols);
+
+    // Map ghost global cols to local off-diagonal indices
+    auto c_o_local = c_imap.map_to_local(
+        d_o_gcols, experimental::distributed::index_space::non_local);
+
+    // Pull c_o_local back to host for CSR construction
+    const auto n_o_entries = c_o_gcols.size();
+    std::vector<LocalIndexType> c_o_cols_h(n_o_entries);
+    if (n_o_entries > 0)
+        host->copy_from(exec, n_o_entries, c_o_local.get_const_data(),
+                        c_o_cols_h.data());
+
+    // Build C_diag and C_off CSR matrices
+    const auto C_n_local_rows =
+        static_cast<size_type>(n_local);
+    const auto C_n_off_cols =
+        static_cast<size_type>(c_imap.get_non_local_size());
+
+    auto C_diag_csr = share(coo_to_csr<ValueType, LocalIndexType>(
+        exec, host, C_n_local_rows, n_local_B,
+        c_d_rows, c_d_cols, c_d_vals));
+    auto C_off_csr  = share(coo_to_csr<ValueType, LocalIndexType>(
+        exec, host, C_n_local_rows, C_n_off_cols,
+        c_o_rows, c_o_cols_h, c_o_vals));
+
+    // Build RowGatherer for C
+    auto c_rg = RowGatherer<LocalIndexType>::create(
+        exec,
+        C->row_gatherer_->get_collective_communicator()
+            ->create_with_same_type(comm, &c_imap),
+        c_imap);
+
+    // Write output C
+    const size_type C_global_rows = this->get_size()[0];
+    const size_type C_global_cols = B->get_size()[1];
+    C->set_size(dim<2>{C_global_rows, C_global_cols});
+    C->imap_         = std::move(c_imap);
+    C->diag_mtx_     = std::move(C_diag_csr);
+    C->off_diag_mtx_ = std::move(C_off_csr);
+    C->row_gatherer_ = std::move(c_rg);
+}
+
+
 template <typename ValueType, typename LocalIndexType, typename GlobalIndexType>
 void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_impl(
     const LinOp* b, LinOp* x) const
 {
+    // SpGeMM: C = A * B where B and C are distributed matrices (same type)
+    if (auto b_mat = dynamic_cast<const Matrix*>(b)) {
+        if (auto x_mat = dynamic_cast<Matrix*>(x)) {
+            this->apply_spgemm(b_mat, x_mat);
+            return;
+        }
+    }
     distributed::mixed_precision_dispatch_real_complex<ValueType>(
         [this](const auto dense_b, auto dense_x) {
             using x_value_type =

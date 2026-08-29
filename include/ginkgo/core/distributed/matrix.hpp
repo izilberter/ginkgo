@@ -453,6 +453,15 @@ public:
     }
 
     /**
+     * Get read access to the index map defining the ghost column communication
+     * pattern for this matrix.
+     */
+    const index_map<local_index_type, global_index_type>& get_index_map() const
+    {
+        return imap_;
+    }
+
+    /**
      * @deprecated Use get_diag_matrix() instead.
      */
     GKO_DEPRECATED("use get_diag_matrix() instead")
@@ -757,6 +766,13 @@ protected:
 
     void apply_impl(const LinOp* alpha, const LinOp* b, const LinOp* beta,
                     LinOp* x) const override;
+
+    /**
+     * Distributed sparse matrix-matrix product: C = A * B.
+     * Both B and C must be Matrix instances with the same template parameters.
+     * Local blocks must be CSR. Assumes contiguous row/column partitions.
+     */
+    void apply_spgemm(const Matrix* B, Matrix* C) const;
 
 private:
     std::shared_ptr<RowGatherer<LocalIndexType>> row_gatherer_;

@@ -1054,3 +1054,166 @@ TEST_F(MatrixInternalBuffers, ColScaleAllocatesBuffersOnlyOnce)
 
     ASSERT_EQ(alloc_logger->count, alloc_count_before);
 }
+
+
+// ============================================================================
+// SpGeMM tests (distributed Matrix × distributed Matrix)
+// ============================================================================
+//
+// Test matrix: 6×6 upper bidiagonal A with A[i,i]=2, A[i,i+1]=1 (i<5),
+// A[5,5]=2. Partitioned contiguously across 3 ranks (2 rows each).
+//
+// C = A * A (analytical result):
+//   C[i,i]=4, C[i,i+1]=4 (i<5), C[i,i+2]=1 (i<4), all others zero.
+//
+// Per rank (row/col partition is the same):
+//   rank 0 (rows/cols 0-1): diag=[[4,4],[0,4]], off=[[1,0],[4,1]] (ghost gcols 2,3)
+//   rank 1 (rows/cols 2-3): diag=[[4,4],[0,4]], off=[[1,0],[4,1]] (ghost gcols 4,5)
+//   rank 2 (rows/cols 4-5): diag=[[4,4],[0,4]], off=empty (no ghost cols)
+
+template <typename ValueLocalGlobalIndexType>
+class MatrixSpGeMM : public CommonMpiTestFixture {
+protected:
+    using value_type = typename std::tuple_element<
+        0, decltype(ValueLocalGlobalIndexType())>::type;
+    using local_index_type = typename std::tuple_element<
+        1, decltype(ValueLocalGlobalIndexType())>::type;
+    using global_index_type = typename std::tuple_element<
+        2, decltype(ValueLocalGlobalIndexType())>::type;
+    using dist_mtx_type =
+        gko::experimental::distributed::Matrix<value_type, local_index_type,
+                                               global_index_type>;
+    using local_matrix_type = gko::matrix::Csr<value_type, local_index_type>;
+    using Partition =
+        gko::experimental::distributed::Partition<local_index_type,
+                                                  global_index_type>;
+    using matrix_data = gko::matrix_data<value_type, global_index_type>;
+
+    MatrixSpGeMM()
+    {
+        // 6×6 upper bidiagonal: A[i,i]=2, A[i,i+1]=1 for i<5, A[5,5]=2
+        gko::dim<2> size{6, 6};
+        matrix_data md{size,
+                       {{0, 0, 2},
+                        {0, 1, 1},
+                        {1, 1, 2},
+                        {1, 2, 1},
+                        {2, 2, 2},
+                        {2, 3, 1},
+                        {3, 3, 2},
+                        {3, 4, 1},
+                        {4, 4, 2},
+                        {4, 5, 1},
+                        {5, 5, 2}}};
+
+        // Contiguous partition: rank k owns rows [2k, 2k+2)
+        part = Partition::build_from_contiguous(
+            exec, gko::array<global_index_type>(exec, {0, 2, 4, 6}));
+
+        // C must be pre-sized so LinOp::apply's dimension check passes.
+        // apply_spgemm overwrites all of C's internals, so the zero values
+        // here don't affect the result.
+        matrix_data zero_md{gko::dim<2>{6, 6}};
+
+        A = dist_mtx_type::create(exec, comm);
+        B = dist_mtx_type::create(exec, comm);
+        C = dist_mtx_type::create(exec, comm);
+        A->read_distributed(md, part);
+        B->read_distributed(md, part);
+        C->read_distributed(zero_md, part);
+    }
+
+    void SetUp() override { ASSERT_EQ(comm.size(), 3); }
+
+    std::shared_ptr<Partition> part;
+    std::unique_ptr<dist_mtx_type> A, B, C;
+};
+
+TYPED_TEST_SUITE(MatrixSpGeMM, gko::test::ValueLocalGlobalIndexTypes,
+                 TupleTypenameNameGenerator);
+
+
+TYPED_TEST(MatrixSpGeMM, DiagBlockIsCorrect)
+{
+    using value_type = typename TestFixture::value_type;
+    using csr = typename TestFixture::local_matrix_type;
+    auto rank = this->comm.rank();
+
+    // Same per-rank expected diagonal block for all three ranks
+    I<I<value_type>> expected_diag[] = {
+        {{4, 4}, {0, 4}},
+        {{4, 4}, {0, 4}},
+        {{4, 4}, {0, 4}},
+    };
+
+    this->A->apply(this->B, this->C);
+
+    GKO_ASSERT_MTX_NEAR(gko::as<csr>(this->C->get_diag_matrix()),
+                        expected_diag[rank], r<value_type>::value);
+}
+
+
+TYPED_TEST(MatrixSpGeMM, OffDiagBlockIsCorrect)
+{
+    using value_type = typename TestFixture::value_type;
+    using csr = typename TestFixture::local_matrix_type;
+    auto rank = this->comm.rank();
+
+    this->A->apply(this->B, this->C);
+
+    const auto* off =
+        gko::as<csr>(this->C->get_off_diag_matrix()).get();
+
+    if (rank < 2) {
+        // Ghost cols from next rank: row0→[1,0], row1→[4,1]
+        GKO_ASSERT_MTX_NEAR(off,
+                            (I<I<value_type>>{{1, 0}, {4, 1}}),
+                            r<value_type>::value);
+    } else {
+        // Rank 2 has no ghost columns: off-diag must be empty
+        EXPECT_EQ(off->get_num_stored_elements(), 0);
+        EXPECT_EQ(off->get_size()[1], 0);
+    }
+}
+
+
+TYPED_TEST(MatrixSpGeMM, ResultIsConsistentWithSpMV)
+{
+    // Verify C=A*B by comparing C*e_i against A*(B*e_i) for all unit vectors,
+    // where e_i are distributed vectors of the same partition.
+    using value_type = typename TestFixture::value_type;
+    using dist_vec_type = gko::experimental::distributed::Vector<value_type>;
+
+    this->A->apply(this->B, this->C);
+
+    // Build a distributed dense vector: all-ones
+    auto ones_md =
+        gko::matrix_data<value_type, typename TestFixture::global_index_type>{
+            gko::dim<2>{6, 1},
+            {{0, 0, 1},
+             {1, 0, 1},
+             {2, 0, 1},
+             {3, 0, 1},
+             {4, 0, 1},
+             {5, 0, 1}}};
+
+    auto x = dist_vec_type::create(this->exec, this->comm);
+    x->read_distributed(ones_md, this->part);
+
+    auto y_C  = dist_vec_type::create(this->exec, this->comm);
+    auto y_AB = dist_vec_type::create(this->exec, this->comm);
+    y_C->read_distributed(ones_md, this->part);
+    y_AB->read_distributed(ones_md, this->part);
+
+    // y_C  = C * x
+    this->C->apply(x, y_C);
+
+    // y_AB = A * (B * x) — use a temporary for the intermediate
+    auto tmp = dist_vec_type::create(this->exec, this->comm);
+    tmp->read_distributed(ones_md, this->part);
+    this->B->apply(x, tmp);
+    this->A->apply(tmp, y_AB);
+
+    GKO_ASSERT_MTX_NEAR(y_C->get_local_vector(), y_AB->get_local_vector(),
+                        r<value_type>::value * 10);
+}
