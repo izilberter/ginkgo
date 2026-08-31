@@ -206,6 +206,10 @@ void Pmis<ValueType, IndexType>::generate_distributed(
     using dist_matrix_type =
         experimental::distributed::Matrix<ValueType, IndexType, GlobalIndexType>;
 
+    // 64-bit local indices are not supported: the coarse matrix construction
+    // uses SpGeMM, which CUDA's cuSPARSE only supports with 32-bit indices.
+    if (sizeof(IndexType) > sizeof(int32)) GKO_NOT_IMPLEMENTED;
+
     auto exec = this->get_executor();
     auto comm = matrix->get_communicator();
 
@@ -311,8 +315,11 @@ void Pmis<ValueType, IndexType>::generate_distributed(
     // 9. Communicate ghost coarse global indices
     // For each local node i: send its coarse global index (or sentinel=-1 if fine).
     const GlobalIndexType sentinel = -1;
-    auto part_offset = static_cast<GlobalIndexType>(
-        coarse_partition->get_range_bounds()[comm.rank()]);
+    // coarse_partition lives on exec (may be a GPU), so get_range_bounds() returns
+    // a device pointer. Copy the needed element to host before indexing.
+    GlobalIndexType part_offset;
+    exec->get_master()->copy_from(exec, 1,
+        coarse_partition->get_range_bounds() + comm.rank(), &part_offset);
 
     const auto send_size = coll_comm->get_send_size();
     const auto recv_size = coll_comm->get_recv_size();

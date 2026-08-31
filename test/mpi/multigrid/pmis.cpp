@@ -61,6 +61,10 @@ protected:
                                        {5, 2, -1}, {6, 0, 3},  {6, 1, 5},
                                        {6, 2, -2}, {7, 1, 6},  {7, 3, -5}}}
     {
+        // Guard: constructor runs before SetUp(), so skip setup if rank count
+        // is wrong to avoid crashing on mismatched partition/communicator size.
+        if (comm.size() != 3) return;
+
         row_part = Partition::build_from_contiguous(
             exec, gko::array<global_index_type>(
                       exec, I<global_index_type>{0, 2, 4, 8}));
@@ -91,6 +95,11 @@ TYPED_TEST(Pmis, CanGenerateFromDistributedMatrix)
     auto rank = this->comm.rank();
     // PMIS uses random weights so coarsening is non-deterministic.
     // Retry a few times to avoid intermittent failures.
+    using local_index_type = typename TestFixture::local_index_type;
+    if (sizeof(local_index_type) > sizeof(gko::int32)) {
+        GTEST_SKIP() << "64-bit local indices not supported by distributed PMIS";
+    }
+
     std::shared_ptr<pmis> result;
     for (int attempt = 0; attempt < 5; ++attempt) {
         try {
