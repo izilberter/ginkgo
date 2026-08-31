@@ -1409,3 +1409,213 @@ TYPED_TEST(MatrixSpGeMM, ResultIsConsistentWithSpMV)
     GKO_ASSERT_MTX_NEAR(y_C->get_local_vector(), y_AB->get_local_vector(),
                         r<value_type>::value * 10);
 }
+
+
+// ============================================================================
+// Non-square distributed matrix: SpGeMM and write() tests
+// ============================================================================
+//
+// A: 6×3 global (faceMap × cellMap).
+//   face partition: rank k owns rows [2k, 2k+2).
+//   cell partition: rank k owns row k.
+//   A[2j,j]=1, A[2j+1,j]=2 for j=0..2 (block-diagonal, one row/col per rank),
+//   plus A[0,1]=3 (rank 0 references rank 1's column) to exercise ghost-row
+//   exchange during SpGeMM.
+//
+// B: 3×6 global (cellMap × faceMap).
+//   B[j,2j]=3, B[j,2j+1]=4 for j=0..2. Block-diagonal; each rank owns 1 row.
+//
+// C = A*B: 6×6 global.
+//   Row 0: (0,3),(1,4),(2,9),(3,12)   ← A[0,0]*B[0,:] + A[0,1]*B[1,:]
+//   Row 1: (0,6),(1,8)
+//   Row 2: (2,3),(3,4)
+//   Row 3: (2,6),(3,8)
+//   Row 4: (4,3),(5,4)
+//   Row 5: (4,6),(5,8)
+//
+// Per-rank C blocks (C col partition = face_part):
+//   rank 0 (cols 0-1): diag=[[3,4],[6,8]]  off=[[9,12],[0,0]] (ghost cols 2,3)
+//   rank 1 (cols 2-3): diag=[[3,4],[6,8]]  off=empty
+//   rank 2 (cols 4-5): diag=[[3,4],[6,8]]  off=empty
+
+template <typename ValueLocalGlobalIndexType>
+class MatrixNonSquare : public CommonMpiTestFixture {
+protected:
+    using value_type = typename std::tuple_element<
+        0, decltype(ValueLocalGlobalIndexType())>::type;
+    using local_index_type = typename std::tuple_element<
+        1, decltype(ValueLocalGlobalIndexType())>::type;
+    using global_index_type = typename std::tuple_element<
+        2, decltype(ValueLocalGlobalIndexType())>::type;
+    using dist_mtx_type =
+        gko::experimental::distributed::Matrix<value_type, local_index_type,
+                                               global_index_type>;
+    using dist_vec_type = gko::experimental::distributed::Vector<value_type>;
+    using local_matrix_type = gko::matrix::Csr<value_type, local_index_type>;
+    using Partition =
+        gko::experimental::distributed::Partition<local_index_type,
+                                                  global_index_type>;
+    using matrix_data = gko::matrix_data<value_type, global_index_type>;
+    using writable_type =
+        gko::WritableToMatrixData<value_type, global_index_type>;
+
+    MatrixNonSquare()
+    {
+        // face partition: rank k → rows [2k, 2k+2)
+        face_part = Partition::build_from_contiguous(
+            exec, gko::array<global_index_type>(exec, {0, 2, 4, 6}));
+        // cell partition: rank k → row k
+        cell_part = Partition::build_from_contiguous(
+            exec, gko::array<global_index_type>(exec, {0, 1, 2, 3}));
+
+        // A: 6×3. A[0,1]=3 creates a ghost column reference on rank 0.
+        matrix_data A_md{gko::dim<2>{6, 3},
+                         {{0, 0, 1},
+                          {0, 1, 3},
+                          {1, 0, 2},
+                          {2, 1, 1},
+                          {3, 1, 2},
+                          {4, 2, 1},
+                          {5, 2, 2}}};
+
+        // B: 3×6. B[j,2j]=3, B[j,2j+1]=4.
+        matrix_data B_md{gko::dim<2>{3, 6},
+                         {{0, 0, 3},
+                          {0, 1, 4},
+                          {1, 2, 3},
+                          {1, 3, 4},
+                          {2, 4, 3},
+                          {2, 5, 4}}};
+
+        // C pre-sized as 6×6; apply_spgemm will overwrite its internals.
+        matrix_data zero_md{gko::dim<2>{6, 6}};
+
+        A = dist_mtx_type::create(exec, comm);
+        B = dist_mtx_type::create(exec, comm);
+        C = dist_mtx_type::create(exec, comm);
+        A->read_distributed(A_md, face_part, cell_part);
+        B->read_distributed(B_md, cell_part, face_part);
+        C->read_distributed(zero_md, face_part);
+    }
+
+    void SetUp() override { ASSERT_EQ(comm.size(), 3); }
+
+    std::shared_ptr<Partition> face_part;
+    std::shared_ptr<Partition> cell_part;
+    std::unique_ptr<dist_mtx_type> A, B, C;
+};
+
+TYPED_TEST_SUITE(MatrixNonSquare, gko::test::ValueLocalGlobalIndexTypes,
+                 TupleTypenameNameGenerator);
+
+
+TYPED_TEST(MatrixNonSquare, WriteHasCorrectSize)
+{
+    using writable_type = typename TestFixture::writable_type;
+    typename TestFixture::matrix_data written;
+
+    gko::as<writable_type>(this->A.get())->write(written);
+
+    EXPECT_EQ(written.size, (gko::dim<2>{6, 3}));
+}
+
+
+TYPED_TEST(MatrixNonSquare, WriteHasCorrectEntries)
+{
+    using value_type = typename TestFixture::value_type;
+    using global_index_type = typename TestFixture::global_index_type;
+    using writable_type = typename TestFixture::writable_type;
+    using entry_type = gko::matrix_data_entry<value_type, global_index_type>;
+    const auto rank = this->comm.rank();
+
+    typename TestFixture::matrix_data written;
+    gko::as<writable_type>(this->A.get())->write(written);
+
+    // Expected local nonzeros per rank (sorted row-major by write()).
+    std::vector<entry_type> expected[] = {
+        // rank 0: rows 0, 1
+        {{0, 0, value_type{1}}, {0, 1, value_type{3}}, {1, 0, value_type{2}}},
+        // rank 1: rows 2, 3
+        {{2, 1, value_type{1}}, {3, 1, value_type{2}}},
+        // rank 2: rows 4, 5
+        {{4, 2, value_type{1}}, {5, 2, value_type{2}}},
+    };
+
+    ASSERT_EQ(written.size, (gko::dim<2>{6, 3}));
+    ASSERT_EQ(written.nonzeros.size(), expected[rank].size());
+    for (gko::size_type i = 0; i < written.nonzeros.size(); i++) {
+        EXPECT_EQ(written.nonzeros[i], expected[rank][i]);
+    }
+}
+
+
+TYPED_TEST(MatrixNonSquare, SpGeMM_DiagBlockIsCorrect)
+{
+    using value_type = typename TestFixture::value_type;
+    using csr = typename TestFixture::local_matrix_type;
+
+    this->A->apply(this->B, this->C);
+
+    // All ranks: C's local diagonal block is [[3,4],[6,8]].
+    GKO_ASSERT_MTX_NEAR(gko::as<csr>(this->C->get_diag_matrix()),
+                        (I<I<value_type>>{{3, 4}, {6, 8}}),
+                        r<value_type>::value);
+}
+
+
+TYPED_TEST(MatrixNonSquare, SpGeMM_OffDiagBlockIsCorrect)
+{
+    using value_type = typename TestFixture::value_type;
+    using csr = typename TestFixture::local_matrix_type;
+    const auto rank = this->comm.rank();
+
+    this->A->apply(this->B, this->C);
+
+    const auto* off = gko::as<csr>(this->C->get_off_diag_matrix()).get();
+
+    if (rank == 0) {
+        // Row 0 of C picks up cols 2,3 from rank 1 via A[0,1]=3 * B[1,:].
+        // Row 1 has no off-diagonal entries.
+        GKO_ASSERT_MTX_NEAR(off, (I<I<value_type>>{{9, 12}, {0, 0}}),
+                            r<value_type>::value);
+    } else {
+        // Ranks 1 and 2 have no off-diagonal entries in C.
+        EXPECT_EQ(off->get_num_stored_elements(), 0);
+        EXPECT_EQ(off->get_size()[1], 0);
+    }
+}
+
+
+TYPED_TEST(MatrixNonSquare, SpGeMM_ConsistentWithSpMV)
+{
+    // Verify C=A*B by checking (C*x) == A*(B*x) for an all-ones vector x.
+    // x lives on face_part (6 rows); tmp = B*x lives on cell_part (3 rows).
+    using value_type = typename TestFixture::value_type;
+    using dist_vec_type = typename TestFixture::dist_vec_type;
+    using global_index_type = typename TestFixture::global_index_type;
+
+    this->A->apply(this->B, this->C);
+
+    gko::matrix_data<value_type, global_index_type> ones6_md{
+        gko::dim<2>{6, 1},
+        {{0,0,1},{1,0,1},{2,0,1},{3,0,1},{4,0,1},{5,0,1}}};
+    gko::matrix_data<value_type, global_index_type> ones3_md{
+        gko::dim<2>{3, 1}, {{0,0,1},{1,0,1},{2,0,1}}};
+
+    auto x    = dist_vec_type::create(this->exec, this->comm);
+    auto tmp  = dist_vec_type::create(this->exec, this->comm);
+    auto y_C  = dist_vec_type::create(this->exec, this->comm);
+    auto y_AB = dist_vec_type::create(this->exec, this->comm);
+
+    x->read_distributed(ones6_md, this->face_part);
+    tmp->read_distributed(ones3_md, this->cell_part);
+    y_C->read_distributed(ones6_md, this->face_part);
+    y_AB->read_distributed(ones6_md, this->face_part);
+
+    this->C->apply(x, y_C);        // y_C  = C * x  (6×6 * 6 → 6)
+    this->B->apply(x, tmp);        // tmp  = B * x  (3×6 * 6 → 3)
+    this->A->apply(tmp, y_AB);     // y_AB = A * tmp (6×3 * 3 → 6)
+
+    GKO_ASSERT_MTX_NEAR(y_C->get_local_vector(), y_AB->get_local_vector(),
+                        r<value_type>::value * 10);
+}

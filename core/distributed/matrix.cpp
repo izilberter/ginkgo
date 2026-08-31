@@ -44,6 +44,7 @@ template <typename ValueType, typename LocalIndexType, typename GlobalIndexType>
 void append_global_matrix_data(
     std::shared_ptr<const Executor> exec,
     const matrix_data<ValueType, LocalIndexType>& local_data,
+    GlobalIndexType row_offset,
     const index_map<LocalIndexType, GlobalIndexType>& imap,
     index_space col_space, matrix_data<ValueType, GlobalIndexType>& result)
 {
@@ -55,22 +56,26 @@ void append_global_matrix_data(
         device_matrix_data<ValueType, LocalIndexType>::create_from_host(
             exec, local_data);
     const auto nnz = device_data.get_num_stored_elements();
-    auto local_row_idxs =
-        make_array_view(exec, nnz, device_data.get_row_idxs());
     auto local_col_idxs =
         make_array_view(exec, nnz, device_data.get_col_idxs());
-    auto global_row_idxs =
-        imap.map_to_global(local_row_idxs, index_space::local);
     auto global_col_idxs = imap.map_to_global(local_col_idxs, col_space);
-    auto values = make_array_view(exec, nnz, device_data.get_values());
-    auto global_data =
-        device_matrix_data<ValueType, GlobalIndexType>{
-            exec, result.size, std::move(global_row_idxs),
-            std::move(global_col_idxs), std::move(values)}
-            .copy_to_host();
 
-    result.nonzeros.insert(result.nonzeros.end(), global_data.nonzeros.begin(),
-                           global_data.nonzeros.end());
+    // Copy global column indices and values back to host.
+    auto host = exec->get_master();
+    std::vector<GlobalIndexType> h_cols(nnz);
+    std::vector<ValueType> h_vals(nnz);
+    host->copy_from(exec, nnz, global_col_idxs.get_const_data(), h_cols.data());
+    host->copy_from(exec, nnz, device_data.get_values(), h_vals.data());
+
+    // Rows: global row = row_offset + local_row (read directly from host data).
+    // Using imap to map rows would be wrong for non-square matrices because
+    // imap_ is built from the column partition, not the row partition.
+    result.nonzeros.reserve(result.nonzeros.size() + nnz);
+    for (size_type i = 0; i < nnz; i++) {
+        result.nonzeros.push_back(
+            {row_offset + static_cast<GlobalIndexType>(local_data.nonzeros[i].row),
+             h_cols[i], h_vals[i]});
+    }
 }
 
 
@@ -486,7 +491,6 @@ template <typename ValueType, typename LocalIndexType, typename GlobalIndexType>
 void Matrix<ValueType, LocalIndexType, GlobalIndexType>::write(
     matrix_data<value_type, global_index_type>& data) const
 {
-    GKO_ASSERT_IS_SQUARE_MATRIX(this);
     auto diag_data = matrix_data<value_type, local_index_type>{};
     auto off_diag_data = matrix_data<value_type, local_index_type>{};
     as<WritableToMatrixData<ValueType, LocalIndexType>>(this->diag_mtx_)
@@ -496,8 +500,25 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::write(
 
     data = {this->get_size(), {}};
     auto exec = this->get_executor();
-    append_global_matrix_data(exec, diag_data, imap_, index_space::local, data);
-    append_global_matrix_data(exec, off_diag_data, imap_,
+
+    // Compute this rank's global row offset as the exclusive prefix sum of
+    // local row counts. imap_ is built from the column partition and cannot
+    // be used to map row indices for non-square matrices.
+    global_index_type row_offset = 0;
+    {
+        long long local_rows =
+            static_cast<long long>(diag_mtx_->get_size()[0]);
+        long long scan = 0;
+        MPI_Exscan(&local_rows, &scan, 1, MPI_LONG_LONG, MPI_SUM,
+                   this->get_communicator().get());
+        row_offset = (this->get_communicator().rank() == 0)
+                         ? 0
+                         : static_cast<global_index_type>(scan);
+    }
+
+    append_global_matrix_data(exec, diag_data, row_offset, imap_,
+                              index_space::local, data);
+    append_global_matrix_data(exec, off_diag_data, row_offset, imap_,
                               index_space::non_local, data);
     data.sort_row_major();
 }
@@ -809,10 +830,11 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
     const auto* B_diag = gko::as<const csr_type>(B->diag_mtx_).get();
     const auto* B_off  = gko::as<const csr_type>(B->off_diag_mtx_).get();
 
-    const auto n_local   = static_cast<size_type>(A_diag->get_size()[0]);
-    const auto n_ghost_A = static_cast<size_type>(A_off->get_size()[1]);
-    const auto n_local_B = static_cast<size_type>(B_diag->get_size()[1]);
-    const auto n_ghost_B = static_cast<size_type>(B_off->get_size()[1]);
+    const auto n_local        = static_cast<size_type>(A_diag->get_size()[0]);
+    const auto n_ghost_A      = static_cast<size_type>(A_off->get_size()[1]);
+    const auto n_local_B      = static_cast<size_type>(B_diag->get_size()[1]);
+    const auto n_ghost_B      = static_cast<size_type>(B_off->get_size()[1]);
+    const auto n_local_B_rows = static_cast<size_type>(B_diag->get_size()[0]);
 
     // B_col_offset: global index of B's first local column on this rank
     // (exclusive prefix sum of local B column counts across ranks).
@@ -839,10 +861,10 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
     auto A_o_ci = d2h(A_off->get_const_col_idxs(),  A_off->get_num_stored_elements());
     auto A_o_vs = d2h(A_off->get_const_values(),    A_off->get_num_stored_elements());
 
-    auto B_d_rp = d2h(B_diag->get_const_row_ptrs(), n_local + 1);
+    auto B_d_rp = d2h(B_diag->get_const_row_ptrs(), n_local_B_rows + 1);
     auto B_d_ci = d2h(B_diag->get_const_col_idxs(), B_diag->get_num_stored_elements());
     auto B_d_vs = d2h(B_diag->get_const_values(),   B_diag->get_num_stored_elements());
-    auto B_o_rp = d2h(B_off->get_const_row_ptrs(),  n_local + 1);
+    auto B_o_rp = d2h(B_off->get_const_row_ptrs(),  n_local_B_rows + 1);
     auto B_o_ci = d2h(B_off->get_const_col_idxs(),  B_off->get_num_stored_elements());
     auto B_o_vs = d2h(B_off->get_const_values(),    B_off->get_num_stored_elements());
 
@@ -978,8 +1000,8 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
                   comm.get());
 
     // ============================================================
-    // Build A_ext = [A_diag | A_off] (n_local x n_local+n_ghost_A).
-    // A_diag cols unchanged; A_off cols shifted by n_local.
+    // Build A_ext = [A_diag | A_off] (n_local x n_local_B_rows+n_ghost_A).
+    // A_diag cols unchanged; A_off cols shifted by n_local_B_rows.
     // Rows are already col-sorted within each block and the two blocks
     // cover disjoint col ranges, so the merged row is also sorted.
     // ============================================================
@@ -999,7 +1021,7 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
             }
             for (auto j = A_o_rp[r]; j < A_o_rp[r + 1]; j++) {
                 A_ext_ci[pos] =
-                    static_cast<LocalIndexType>(n_local) + A_o_ci[j];
+                    static_cast<LocalIndexType>(n_local_B_rows) + A_o_ci[j];
                 A_ext_vs[pos] = A_o_vs[j];
                 pos++;
             }
@@ -1014,7 +1036,7 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
     std::vector<GlobalIndexType> all_gcols;
     all_gcols.reserve(B_diag->get_num_stored_elements() +
                       B_off->get_num_stored_elements() + total_recv_data);
-    for (size_type r = 0; r < n_local; r++) {
+    for (size_type r = 0; r < n_local_B_rows; r++) {
         for (auto j = B_d_rp[r]; j < B_d_rp[r + 1]; j++)
             all_gcols.push_back(
                 B_col_offset + static_cast<GlobalIndexType>(B_d_ci[j]));
@@ -1038,12 +1060,12 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
 
     // ============================================================
     // Build B_ext (n_local + n_ghost_A rows x m cols).
-    // Rows 0..n_local-1   : local B rows.
-    // Rows n_local..n_local+n_ghost_A-1: fetched ghost B rows.
+    // Rows 0..n_local_B_rows-1                      : local B rows.
+    // Rows n_local_B_rows..n_local_B_rows+n_ghost_A-1: fetched ghost B rows.
     // Each row is sorted by local col index (required by cuSPARSE SpGeMM).
     // ============================================================
     const auto B_ext_nrows =
-        static_cast<size_type>(n_local + n_ghost_A);
+        static_cast<size_type>(n_local_B_rows + n_ghost_A);
     const auto B_ext_nnz =
         B_diag->get_num_stored_elements() + B_off->get_num_stored_elements() +
         static_cast<size_type>(total_recv_data);
@@ -1066,7 +1088,7 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
             };
 
         // Local B rows
-        for (size_type r = 0; r < n_local; r++) {
+        for (size_type r = 0; r < n_local_B_rows; r++) {
             B_ext_rp[r] = static_cast<LocalIndexType>(pos);
             std::vector<std::pair<LocalIndexType, ValueType>> row;
             row.reserve((B_d_rp[r + 1] - B_d_rp[r]) +
@@ -1084,7 +1106,7 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
 
         // Ghost B rows (received)
         for (size_type k = 0; k < n_ghost_A; k++) {
-            B_ext_rp[n_local + k] = static_cast<LocalIndexType>(pos);
+            B_ext_rp[n_local_B_rows + k] = static_cast<LocalIndexType>(pos);
             std::vector<std::pair<LocalIndexType, ValueType>> row;
             row.reserve(recv_nnz[k]);
             for (int j = recv_nnz_offs[k]; j < recv_nnz_offs[k + 1]; j++)
@@ -1113,7 +1135,7 @@ void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
                 std::move(d_vs), std::move(d_ci), std::move(d_rp)));
         };
 
-    auto A_ext_dev = make_dev_csr(n_local, n_local + n_ghost_A,
+    auto A_ext_dev = make_dev_csr(n_local, n_local_B_rows + n_ghost_A,
                                   A_ext_rp, A_ext_ci, A_ext_vs);
     auto B_ext_dev = make_dev_csr(B_ext_nrows, m,
                                   B_ext_rp, B_ext_ci, B_ext_vs);
