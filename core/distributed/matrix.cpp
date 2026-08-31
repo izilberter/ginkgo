@@ -557,6 +557,228 @@ coo_to_csr(std::shared_ptr<const Executor> exec,
 
 
 template <typename ValueType, typename LocalIndexType, typename GlobalIndexType>
+void Matrix<ValueType, LocalIndexType, GlobalIndexType>::add(
+    const Matrix* B, Matrix* C) const
+{
+    // Computes C = A + B (this = A).
+    //
+    // Algorithm (all host-side):
+    //  1. Copy all CSR blocks (diag, off-diag) to host.
+    //  2. Merge A's and B's ghost global column indices into a sorted unique
+    //     list.  For contiguous partitions the imap flat arrays are already
+    //     globally sorted, so std::merge suffices.
+    //  3. Build per-row COO for C_diag by merging the two sorted CSR rows.
+    //  4. Build per-row COO for C_off by remapping each matrix's off-diagonal
+    //     column indices to the merged ghost space, then merging sorted rows.
+    //  5. Construct C's index_map and RowGatherer from the merged ghost cols.
+    //  6. Write all fields of C.
+
+    using csr_type = gko::matrix::Csr<ValueType, LocalIndexType>;
+
+    GKO_ASSERT_EQ(this->get_size()[0], B->get_size()[0]);
+    GKO_ASSERT_EQ(this->get_size()[1], B->get_size()[1]);
+
+    auto exec = this->get_executor();
+    auto host = exec->get_master();
+    auto comm = this->get_communicator();
+    const int my_rank = comm.rank();
+
+    const auto* A_diag = gko::as<const csr_type>(this->diag_mtx_).get();
+    const auto* A_off  = gko::as<const csr_type>(this->off_diag_mtx_).get();
+    const auto* B_diag = gko::as<const csr_type>(B->diag_mtx_).get();
+    const auto* B_off  = gko::as<const csr_type>(B->off_diag_mtx_).get();
+
+    const auto n_local      = static_cast<size_type>(A_diag->get_size()[0]);
+    const auto n_local_cols = static_cast<size_type>(A_diag->get_size()[1]);
+    const auto n_ghost_A    = static_cast<size_type>(A_off->get_size()[1]);
+    const auto n_ghost_B    = static_cast<size_type>(B_off->get_size()[1]);
+
+    auto d2h = [&](const auto* ptr, size_type n) {
+        using T = std::remove_const_t<std::remove_pointer_t<decltype(ptr)>>;
+        std::vector<T> v(n);
+        if (n > 0) host->copy_from(exec, n, ptr, v.data());
+        return v;
+    };
+
+    // ---- Copy all CSR blocks to host ----
+    auto A_d_rp = d2h(A_diag->get_const_row_ptrs(), n_local + 1);
+    auto A_d_ci = d2h(A_diag->get_const_col_idxs(), A_diag->get_num_stored_elements());
+    auto A_d_vs = d2h(A_diag->get_const_values(),   A_diag->get_num_stored_elements());
+    auto B_d_rp = d2h(B_diag->get_const_row_ptrs(), n_local + 1);
+    auto B_d_ci = d2h(B_diag->get_const_col_idxs(), B_diag->get_num_stored_elements());
+    auto B_d_vs = d2h(B_diag->get_const_values(),   B_diag->get_num_stored_elements());
+
+    auto A_o_rp = d2h(A_off->get_const_row_ptrs(), n_local + 1);
+    auto A_o_ci = d2h(A_off->get_const_col_idxs(), A_off->get_num_stored_elements());
+    auto A_o_vs = d2h(A_off->get_const_values(),   A_off->get_num_stored_elements());
+    auto B_o_rp = d2h(B_off->get_const_row_ptrs(), n_local + 1);
+    auto B_o_ci = d2h(B_off->get_const_col_idxs(), B_off->get_num_stored_elements());
+    auto B_o_vs = d2h(B_off->get_const_values(),   B_off->get_num_stored_elements());
+
+    // ---- Merge ghost global column indices ----
+    // For contiguous partitions the imap flat arrays are globally sorted
+    // (gcols from rank j < rank k are all smaller), so std::merge is valid.
+    auto A_ghost_gcol = d2h(
+        this->imap_.get_remote_global_idxs().get_const_flat_data(), n_ghost_A);
+    auto B_ghost_gcol = d2h(
+        B->imap_.get_remote_global_idxs().get_const_flat_data(), n_ghost_B);
+
+    std::vector<GlobalIndexType> C_ghost_gcol;
+    C_ghost_gcol.reserve(n_ghost_A + n_ghost_B);
+    std::merge(A_ghost_gcol.begin(), A_ghost_gcol.end(),
+               B_ghost_gcol.begin(), B_ghost_gcol.end(),
+               std::back_inserter(C_ghost_gcol));
+    C_ghost_gcol.erase(
+        std::unique(C_ghost_gcol.begin(), C_ghost_gcol.end()),
+        C_ghost_gcol.end());
+    const auto n_c_ghost = C_ghost_gcol.size();
+
+    // Build maps: A/B local ghost index → position in C_ghost_gcol.
+    // Monotone because A/B ghost lists are subsets of the merged sorted list.
+    auto make_remap = [&](const std::vector<GlobalIndexType>& src) {
+        std::vector<LocalIndexType> remap(src.size());
+        for (size_type i = 0; i < src.size(); i++) {
+            remap[i] = static_cast<LocalIndexType>(
+                std::lower_bound(C_ghost_gcol.begin(), C_ghost_gcol.end(),
+                                 src[i]) -
+                C_ghost_gcol.begin());
+        }
+        return remap;
+    };
+    const auto A_to_c = make_remap(A_ghost_gcol);
+    const auto B_to_c = make_remap(B_ghost_gcol);
+
+    // ---- Build C diag COO: merge two sorted CSR rows ----
+    std::vector<LocalIndexType> c_d_rows, c_d_cols;
+    std::vector<ValueType> c_d_vals;
+
+    for (size_type r = 0; r < n_local; r++) {
+        auto ai = A_d_rp[r], ae = A_d_rp[r + 1];
+        auto bi = B_d_rp[r], be = B_d_rp[r + 1];
+        while (ai < ae && bi < be) {
+            auto lr = static_cast<LocalIndexType>(r);
+            if (A_d_ci[ai] < B_d_ci[bi]) {
+                c_d_rows.push_back(lr);
+                c_d_cols.push_back(A_d_ci[ai]);
+                c_d_vals.emplace_back(A_d_vs[ai]);
+                ++ai;
+            } else if (A_d_ci[ai] > B_d_ci[bi]) {
+                c_d_rows.push_back(lr);
+                c_d_cols.push_back(B_d_ci[bi]);
+                c_d_vals.emplace_back(B_d_vs[bi]);
+                ++bi;
+            } else {
+                c_d_rows.push_back(lr);
+                c_d_cols.push_back(A_d_ci[ai]);
+                c_d_vals.emplace_back(A_d_vs[ai] + B_d_vs[bi]);
+                ++ai; ++bi;
+            }
+        }
+        for (; ai < ae; ++ai) {
+            c_d_rows.push_back(static_cast<LocalIndexType>(r));
+            c_d_cols.push_back(A_d_ci[ai]);
+            c_d_vals.emplace_back(A_d_vs[ai]);
+        }
+        for (; bi < be; ++bi) {
+            c_d_rows.push_back(static_cast<LocalIndexType>(r));
+            c_d_cols.push_back(B_d_ci[bi]);
+            c_d_vals.emplace_back(B_d_vs[bi]);
+        }
+    }
+
+    // ---- Build C off-diag COO: remap then merge sorted CSR rows ----
+    // After applying A_to_c / B_to_c (both monotone), each row is still
+    // sorted by column, so the merge remains valid.
+    std::vector<LocalIndexType> c_o_rows, c_o_cols;
+    std::vector<ValueType> c_o_vals;
+
+    for (size_type r = 0; r < n_local; r++) {
+        auto ai = A_o_rp[r], ae = A_o_rp[r + 1];
+        auto bi = B_o_rp[r], be = B_o_rp[r + 1];
+        while (ai < ae && bi < be) {
+            auto lr = static_cast<LocalIndexType>(r);
+            auto ac = A_to_c[A_o_ci[ai]];
+            auto bc = B_to_c[B_o_ci[bi]];
+            if (ac < bc) {
+                c_o_rows.push_back(lr);
+                c_o_cols.push_back(ac);
+                c_o_vals.emplace_back(A_o_vs[ai]);
+                ++ai;
+            } else if (ac > bc) {
+                c_o_rows.push_back(lr);
+                c_o_cols.push_back(bc);
+                c_o_vals.emplace_back(B_o_vs[bi]);
+                ++bi;
+            } else {
+                c_o_rows.push_back(lr);
+                c_o_cols.push_back(ac);
+                c_o_vals.emplace_back(A_o_vs[ai] + B_o_vs[bi]);
+                ++ai; ++bi;
+            }
+        }
+        for (; ai < ae; ++ai) {
+            c_o_rows.push_back(static_cast<LocalIndexType>(r));
+            c_o_cols.push_back(A_to_c[A_o_ci[ai]]);
+            c_o_vals.emplace_back(A_o_vs[ai]);
+        }
+        for (; bi < be; ++bi) {
+            c_o_rows.push_back(static_cast<LocalIndexType>(r));
+            c_o_cols.push_back(B_to_c[B_o_ci[bi]]);
+            c_o_vals.emplace_back(B_o_vs[bi]);
+        }
+    }
+
+    // ---- Build C's index_map from merged ghost gcols ----
+    auto col_part = gko::share(
+        experimental::distributed::build_partition_from_local_size<
+            LocalIndexType, GlobalIndexType>(exec, comm, n_local_cols));
+
+    array<GlobalIndexType> d_c_ghost{exec, n_c_ghost};
+    if (n_c_ghost > 0)
+        exec->copy_from(host, n_c_ghost, C_ghost_gcol.data(),
+                        d_c_ghost.get_data());
+
+    auto c_imap =
+        experimental::distributed::index_map<LocalIndexType, GlobalIndexType>(
+            exec, col_part, my_rank, d_c_ghost);
+
+    // Remap c_o_cols from C_ghost_gcol positions to imap non-local indices.
+    // For contiguous partitions these are identical, but we remap via the
+    // imap for correctness in the general case.
+    auto c_ghost_nloc = c_imap.map_to_local(
+        d_c_ghost, experimental::distributed::index_space::non_local);
+    std::vector<LocalIndexType> gcol_to_nloc(n_c_ghost);
+    if (n_c_ghost > 0)
+        host->copy_from(exec, n_c_ghost, c_ghost_nloc.get_const_data(),
+                        gcol_to_nloc.data());
+    for (auto& col : c_o_cols)
+        col = gcol_to_nloc[col];
+
+    const auto n_nonlocal = c_imap.get_non_local_size();
+
+    // ---- Build CSR matrices and RowGatherer for C ----
+    auto C_diag_csr = share(coo_to_csr<ValueType, LocalIndexType>(
+        exec, host, n_local, n_local_cols, c_d_rows, c_d_cols, c_d_vals));
+    auto C_off_csr  = share(coo_to_csr<ValueType, LocalIndexType>(
+        exec, host, n_local, n_nonlocal, c_o_rows, c_o_cols, c_o_vals));
+
+    auto c_rg = RowGatherer<LocalIndexType>::create(
+        exec,
+        C->row_gatherer_->get_collective_communicator()
+            ->create_with_same_type(comm, &c_imap),
+        c_imap);
+
+    // ---- Write C ----
+    const size_type C_global_size = this->get_size()[0];
+    C->set_size(dim<2>{C_global_size, C_global_size});
+    C->imap_         = std::move(c_imap);
+    C->diag_mtx_     = std::move(C_diag_csr);
+    C->off_diag_mtx_ = std::move(C_off_csr);
+    C->row_gatherer_ = std::move(c_rg);
+}
+
+
+template <typename ValueType, typename LocalIndexType, typename GlobalIndexType>
 void Matrix<ValueType, LocalIndexType, GlobalIndexType>::apply_spgemm(
     const Matrix* B, Matrix* C) const
 {

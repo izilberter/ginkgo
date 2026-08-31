@@ -462,6 +462,21 @@ public:
     }
 
     /**
+     * Computes the element-wise sum C = A + B (this = A).
+     *
+     * A, B, and C must share the same communicator and row/column partition.
+     * Local blocks must be CSR.  Assumes contiguous row/column partitions.
+     * C must be pre-sized to the correct global dimensions before calling
+     * (e.g. via read_distributed with a zero matrix of the same size).
+     * The ghost-column structure of C is computed automatically from the
+     * union of A's and B's ghost columns.
+     *
+     * @param B  right operand, must have the same size and partition as A.
+     * @param C  output matrix; its internals are fully replaced on exit.
+     */
+    void add(const Matrix* B, Matrix* C) const;
+
+    /**
      * @deprecated Use get_diag_matrix() instead.
      */
     GKO_DEPRECATED("use get_diag_matrix() instead")
